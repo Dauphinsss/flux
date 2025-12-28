@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run tauri:dev:*)",
+      "Bash(timeout /t 15 /nobreak)",
+      "Bash(cargo build:*)",
+      "Bash(findstr:*)",
+      "Bash(npx @tauri-apps/cli icon:*)",
+      "Bash(powershell -Command:*)",
+      "Bash(powershell -ExecutionPolicy Bypass -File create-icon.ps1)",
+      "Bash(npm run dev:*)",
+      "Bash(npx tsc --noEmit)",
+      "Bash(netstat:*)",
+      "Bash(taskkill /F /PID 19720)",
+      "Bash(taskkill //F //PID 19720)",
+      "Bash(npm install:*)",
+      "Bash(npm run tauri:*)",
+      "Bash(ls:*)",
+      "Bash(npm run tauri:build:*)",
+      "Bash(test:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
