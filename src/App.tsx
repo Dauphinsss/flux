@@ -18,6 +18,12 @@ interface PDFTab {
   scale: number
 }
 
+interface RecentFile {
+  path: string
+  fileName: string
+  lastOpened: number
+}
+
 type ThemeMode = 'light' | 'dark' | 'system'
 
 function App() {
@@ -26,10 +32,40 @@ function App() {
   const [isLoading, setIsLoading] = useState<boolean>(false)
   const [showSettings, setShowSettings] = useState<boolean>(false)
   const [themeMode, setThemeMode] = useState<ThemeMode>('system')
+  const [isDraggingFile, setIsDraggingFile] = useState<boolean>(false)
+  const [recentFiles, setRecentFiles] = useState<RecentFile[]>([])
+  const [showRecents, setShowRecents] = useState<boolean>(false)
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRefs = useRef<Map<string, Map<number, HTMLCanvasElement>>>(new Map())
 
   const activeTab = tabs.find(tab => tab.id === activeTabId)
+
+  // Agregar archivo a recientes
+  const addToRecents = useCallback(async (path: string, fileName: string) => {
+    try {
+      const store = await Store.load('settings.json')
+      let recents = await store.get<RecentFile[]>('recentFiles') || []
+
+      // Eliminar duplicados
+      recents = recents.filter(r => r.path !== path)
+
+      // Agregar al principio
+      recents.unshift({
+        path,
+        fileName,
+        lastOpened: Date.now()
+      })
+
+      // Mantener solo los últimos 10
+      recents = recents.slice(0, 10)
+
+      await store.set('recentFiles', recents)
+      await store.save()
+      setRecentFiles(recents)
+    } catch (error) {
+      console.error('Error al guardar en recientes:', error)
+    }
+  }, [])
 
   // Cargar PDF desde una ruta
   const loadPDFFromPath = useCallback(async (path: string) => {
@@ -59,12 +95,16 @@ function App() {
 
       setTabs(prev => [...prev, newTab])
       setActiveTabId(newTab.id)
+
+      // Agregar a recientes
+      await addToRecents(path, fileName)
+
       setIsLoading(false)
     } catch (error) {
       console.error('Error al cargar el PDF:', error)
       setIsLoading(false)
     }
-  }, [])
+  }, [addToRecents])
 
   // Aplicar tema
   useEffect(() => {
@@ -102,12 +142,15 @@ function App() {
         const store = await Store.load('settings.json')
         const savedTheme = await store.get<ThemeMode>('theme')
         const savedTabs = await store.get<{ path: string }[]>('openTabs')
+        const savedRecents = await store.get<RecentFile[]>('recentFiles') || []
 
-        console.log('Configuración cargada:', { savedTheme, savedTabs })
+        console.log('Configuración cargada:', { savedTheme, savedTabs, savedRecents })
 
         if (savedTheme) {
           setThemeMode(savedTheme)
         }
+
+        setRecentFiles(savedRecents)
 
         if (savedTabs && savedTabs.length > 0) {
           console.log('Cargando último PDF:', savedTabs[0].path)
@@ -119,6 +162,24 @@ function App() {
     }
 
     loadSettings()
+  }, [loadPDFFromPath])
+
+  // Escuchar archivos abiertos desde línea de comandos
+  useEffect(() => {
+    const setupCliListener = async () => {
+      const appWindow = getCurrentWindow()
+
+      await appWindow.listen<string[]>('open-file-from-cli', async (event) => {
+        console.log('Archivos desde CLI:', event.payload)
+        for (const path of event.payload) {
+          if (path.toLowerCase().endsWith('.pdf')) {
+            await loadPDFFromPath(path)
+          }
+        }
+      })
+    }
+
+    setupCliListener()
   }, [loadPDFFromPath])
 
   // Guardar pestañas abiertas
@@ -263,6 +324,33 @@ function App() {
     renderAllPages()
   }, [activeTab?.id, activeTab?.scale])
 
+  // File drop handler
+  useEffect(() => {
+    const setupFileDrop = async () => {
+      const appWindow = getCurrentWindow()
+
+      await appWindow.onDragDropEvent(async (event) => {
+        if (event.payload.type === 'enter') {
+          setIsDraggingFile(true)
+        } else if (event.payload.type === 'leave') {
+          setIsDraggingFile(false)
+        } else if (event.payload.type === 'drop') {
+          setIsDraggingFile(false)
+          const paths = event.payload.paths
+
+          // Filtrar solo archivos PDF
+          for (const path of paths) {
+            if (path.toLowerCase().endsWith('.pdf')) {
+              await loadPDFFromPath(path)
+            }
+          }
+        }
+      })
+    }
+
+    setupFileDrop()
+  }, [loadPDFFromPath])
+
   // Hotkeys
   useEffect(() => {
     const handleKeyPress = (e: KeyboardEvent) => {
@@ -326,6 +414,49 @@ function App() {
           >
             + Nuevo
           </button>
+
+          {recentFiles.length > 0 && (
+            <div className="relative">
+              <button
+                onClick={() => setShowRecents(!showRecents)}
+                className="flex-shrink-0 px-3 py-1.5 text-xs font-medium text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-800 rounded transition-colors"
+              >
+                Recientes
+              </button>
+
+              {showRecents && (
+                <>
+                  <div
+                    className="fixed inset-0 z-30"
+                    onClick={() => setShowRecents(false)}
+                  />
+                  <div className="absolute top-full left-0 mt-1 w-64 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow-xl z-40 max-h-80 overflow-y-auto">
+                    <div className="p-2 border-b border-gray-200 dark:border-gray-700">
+                      <p className="text-xs font-semibold text-gray-700 dark:text-gray-300 px-2">Archivos Recientes</p>
+                    </div>
+                    {recentFiles.map((file) => (
+                      <button
+                        key={file.path}
+                        onClick={async () => {
+                          setShowRecents(false)
+                          await loadPDFFromPath(file.path)
+                        }}
+                        className="w-full px-3 py-2 text-left text-xs hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+                      >
+                        <div className="flex items-center gap-2">
+                          <FileTextIcon className="w-3 h-3 text-gray-500 dark:text-gray-400 flex-shrink-0" />
+                          <div className="flex-1 min-w-0">
+                            <p className="text-gray-900 dark:text-gray-100 truncate font-medium">{file.fileName}</p>
+                            <p className="text-gray-500 dark:text-gray-500 truncate text-[10px]">{file.path}</p>
+                          </div>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
 
           {tabs.map(tab => (
             <div
@@ -408,17 +539,26 @@ function App() {
 
       {/* Settings Panel */}
       {showSettings && (
-        <div className="absolute top-0 right-0 w-80 h-full bg-white dark:bg-gray-900 border-l border-gray-200 dark:border-gray-800 shadow-xl z-50">
-          <div className="p-6">
-            <div className="flex items-center justify-between mb-6">
-              <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">Ajustes</h2>
-              <button
-                onClick={() => setShowSettings(false)}
-                className="p-1.5 hover:bg-gray-100 dark:hover:bg-gray-800 rounded transition-colors"
-              >
-                <Cross2Icon className="w-4 h-4" />
-              </button>
-            </div>
+        <>
+          {/* Backdrop */}
+          <div
+            className="fixed inset-0 bg-black/20 dark:bg-black/40 z-40"
+            onClick={() => setShowSettings(false)}
+          />
+
+          {/* Panel */}
+          <div className="absolute top-0 right-0 w-80 h-full bg-white dark:bg-gray-900 border-l border-gray-200 dark:border-gray-800 shadow-xl z-50">
+            <div className="p-6">
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">Ajustes</h2>
+                <button
+                  onClick={() => setShowSettings(false)}
+                  className="p-1.5 hover:bg-gray-100 dark:hover:bg-gray-800 rounded transition-colors"
+                  title="Cerrar"
+                >
+                  <Cross2Icon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
+                </button>
+              </div>
 
             <div className="space-y-6">
               <div>
@@ -485,6 +625,22 @@ function App() {
                 </div>
               </div>
             </div>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Drag and Drop Overlay */}
+      {isDraggingFile && (
+        <div className="fixed inset-0 bg-blue-500/10 dark:bg-blue-400/10 backdrop-blur-sm z-50 flex items-center justify-center pointer-events-none">
+          <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl p-8 border-2 border-dashed border-blue-500 dark:border-blue-400">
+            <FileTextIcon className="w-16 h-16 mx-auto text-blue-500 dark:text-blue-400 mb-4" />
+            <p className="text-xl font-semibold text-gray-900 dark:text-gray-100">
+              Suelta el PDF aquí
+            </p>
+            <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">
+              Para abrir en una nueva pestaña
+            </p>
           </div>
         </div>
       )}
