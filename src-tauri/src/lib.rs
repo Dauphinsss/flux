@@ -1,9 +1,133 @@
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, State};
+use tauri_plugin_deep_link::DeepLinkExt;
 use std::env;
+use std::sync::Mutex;
+use std::fs;
+use std::path::PathBuf;
+use serde::Serialize;
+
+// Estado global para almacenar archivos pendientes
+struct PendingFiles(Mutex<Vec<String>>);
+
+#[derive(Serialize, Clone)]
+struct PdfFileInfo {
+    path: String,
+    name: String,
+    size: u64,
+    modified: u64,
+}
 
 #[tauri::command]
 fn get_cli_args() -> Vec<String> {
     env::args().collect()
+}
+
+#[tauri::command]
+fn search_pdfs_in_directory(directory: String) -> Result<Vec<PdfFileInfo>, String> {
+    let mut pdf_files = Vec::new();
+
+    fn scan_directory(dir: &PathBuf, files: &mut Vec<PdfFileInfo>, depth: usize) {
+        // Limitar profundidad para evitar escaneos muy largos
+        if depth > 5 {
+            return;
+        }
+
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if let Ok(metadata) = entry.metadata() {
+                    if metadata.is_file() {
+                        if let Some(path_str) = entry.path().to_str() {
+                            if path_str.to_lowercase().ends_with(".pdf") {
+                                if let Some(name) = entry.file_name().to_str() {
+                                    if let Ok(modified) = metadata.modified() {
+                                        if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                                            files.push(PdfFileInfo {
+                                                path: path_str.to_string(),
+                                                name: name.to_string(),
+                                                size: metadata.len(),
+                                                modified: duration.as_secs(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if metadata.is_dir() {
+                        // Escanear subdirectorios recursivamente
+                        scan_directory(&entry.path(), files, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+
+    let path = PathBuf::from(&directory);
+    if !path.exists() {
+        return Err("El directorio no existe".to_string());
+    }
+
+    scan_directory(&path, &mut pdf_files, 0);
+    Ok(pdf_files)
+}
+
+#[tauri::command]
+fn get_common_directories() -> Vec<String> {
+    let mut dirs = Vec::new();
+
+    // Directorios comunes en Windows
+    if let Some(user_profile) = env::var_os("USERPROFILE") {
+        let user_path = PathBuf::from(user_profile);
+
+        // Documentos
+        let documents = user_path.join("Documents");
+        if documents.exists() {
+            if let Some(path_str) = documents.to_str() {
+                dirs.push(path_str.to_string());
+            }
+        }
+
+        // Descargas
+        let downloads = user_path.join("Downloads");
+        if downloads.exists() {
+            if let Some(path_str) = downloads.to_str() {
+                dirs.push(path_str.to_string());
+            }
+        }
+
+        // Escritorio
+        let desktop = user_path.join("Desktop");
+        if desktop.exists() {
+            if let Some(path_str) = desktop.to_str() {
+                dirs.push(path_str.to_string());
+            }
+        }
+    }
+
+    dirs
+}
+
+#[tauri::command]
+fn take_pending_files(state: State<PendingFiles>) -> Vec<String> {
+    let mut pending = match state.0.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let files = pending.clone();
+    pending.clear();
+    files
+}
+
+#[tauri::command]
+fn open_devtools(window: tauri::WebviewWindow) {
+    window.open_devtools();
+    println!("DevTools opened");
+}
+
+fn extract_pdf_paths(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|arg| arg.to_lowercase().ends_with(".pdf"))
+        .cloned()
+        .collect()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -12,7 +136,39 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_store::Builder::default().build())
-        .invoke_handler(tauri::generate_handler![get_cli_args])
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            println!("Single instance triggered with args: {:?}", args);
+
+            // Cuando se intenta abrir otra instancia, recibimos los argumentos aquí
+            let pdf_files = extract_pdf_paths(&args);
+
+            println!("Extracted PDF files: {:?}", pdf_files);
+
+            if !pdf_files.is_empty() {
+                if let Some(window) = app.get_webview_window("main") {
+                    println!("Focusing window and emitting open-files event");
+                    // Enfocar la ventana existente
+                    let _ = window.set_focus();
+                    let _ = window.unminimize();
+                    // Emitir evento con los archivos
+                    let _ = window.emit("open-files", pdf_files.clone());
+                    println!("Event emitted successfully with files: {:?}", pdf_files);
+                } else {
+                    println!("Window 'main' not found!");
+                }
+            } else {
+                println!("No PDF files found in arguments");
+            }
+        }))
+        .manage(PendingFiles(Mutex::new(Vec::new())))
+        .invoke_handler(tauri::generate_handler![
+            get_cli_args,
+            take_pending_files,
+            open_devtools,
+            search_pdfs_in_directory,
+            get_common_directories
+        ])
         .setup(|app| {
             #[cfg(debug_assertions)]
             {
@@ -20,15 +176,66 @@ pub fn run() {
                 window.open_devtools();
             }
 
-            // Emitir evento con los argumentos de línea de comandos
+            // Registrar el deep-link para archivos PDF
+            println!("Registering deep link...");
+            if let Err(e) = app.deep_link().register("pdf") {
+                println!("Failed to register deep link: {:?}", e);
+            } else {
+                println!("Deep link registered successfully!");
+            }
+
+            // Obtener argumentos de línea de comandos
             let args: Vec<String> = env::args().collect();
-            if args.len() > 1 {
-                // El primer argumento es el ejecutable, los siguientes son archivos
-                let files: Vec<String> = args.into_iter().skip(1).collect();
+            println!("Initial CLI args: {:?}", args);
+
+            let pdf_files = extract_pdf_paths(&args);
+            println!("Extracted PDF files from CLI: {:?}", pdf_files);
+
+            if !pdf_files.is_empty() {
+                // Guardar archivos pendientes para cuando el frontend esté listo
+                if let Some(state) = app.try_state::<PendingFiles>() {
+                    if let Ok(mut pending) = state.0.lock() {
+                        *pending = pdf_files.clone();
+                        println!("Saved to pending files: {:?}", pdf_files);
+                    }
+                }
+
+                // También emitir evento inmediatamente
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.emit("open-file-from-cli", files);
+                    println!("Emitting initial open-files event");
+                    let _ = window.emit("open-files", pdf_files.clone());
                 }
             }
+
+            // Escuchar eventos de deep-link (cuando se abre un archivo asociado)
+            let app_handle = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                println!("Deep link event received!");
+                let urls = event.urls();
+
+                // Debug: imprimir URLs recibidas
+                for url in urls {
+                    println!("URL received: {}", url);
+
+                    // Intentar convertir URL a path de archivo
+                    if let Ok(path) = url.to_file_path() {
+                        println!("Converted to path: {:?}", path);
+
+                        if path.to_string_lossy().to_lowercase().ends_with(".pdf") {
+                            let path_str = path.to_string_lossy().to_string();
+                            println!("Opening PDF: {}", path_str);
+
+                            if let Some(window) = app_handle.get_webview_window("main") {
+                                let _ = window.set_focus();
+                                let _ = window.unminimize();
+                                let _ = window.emit("open-files", vec![path_str]);
+                            }
+                        }
+                    } else {
+                        println!("Failed to convert URL to file path: {}", url);
+                    }
+                }
+            });
 
             Ok(())
         })

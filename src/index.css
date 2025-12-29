@@ -15,3 +15,38 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
+
+/* Search highlight styles */
+.textLayer span.highlight {
+  background-color: rgba(255, 235, 59, 0.4);
+  box-shadow: 0 0 0 1px rgba(255, 193, 7, 0.3);
+  border-radius: 2px;
+  transition: background-color 0.15s ease;
+}
+
+.textLayer span.current-highlight {
+  background-color: rgba(255, 152, 0, 0.6);
+  box-shadow: 0 0 0 2px rgba(255, 111, 0, 0.5);
+  border-radius: 2px;
+  animation: pulse-highlight 1s ease-in-out;
+}
+
+@keyframes pulse-highlight {
+  0%, 100% {
+    box-shadow: 0 0 0 2px rgba(255, 111, 0, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(255, 111, 0, 0.7);
+  }
+}
+
+/* Dark mode highlight styles */
+.dark .textLayer span.highlight {
+  background-color: rgba(255, 235, 59, 0.3);
+  box-shadow: 0 0 0 1px rgba(255, 193, 7, 0.4);
+}
+
+.dark .textLayer span.current-highlight {
+  background-color: rgba(255, 152, 0, 0.5);
+  box-shadow: 0 0 0 2px rgba(255, 111, 0, 0.6);
+}
