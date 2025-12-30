@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use std::fs;
 use std::path::PathBuf;
 use serde::Serialize;
+use rayon::prelude::*;
 
 // Estado global para almacenar archivos pendientes
 struct PendingFiles(Mutex<Vec<String>>);
@@ -24,49 +25,67 @@ fn get_cli_args() -> Vec<String> {
 
 #[tauri::command]
 fn search_pdfs_in_directory(directory: String) -> Result<Vec<PdfFileInfo>, String> {
-    let mut pdf_files = Vec::new();
+    let path = PathBuf::from(&directory);
+    if !path.exists() {
+        return Err("El directorio no existe".to_string());
+    }
 
-    fn scan_directory(dir: &PathBuf, files: &mut Vec<PdfFileInfo>, depth: usize) {
-        // Limitar profundidad para evitar escaneos muy largos
-        if depth > 5 {
-            return;
+    // Recolectar todos los directorios a escanear primero (máximo 3 niveles)
+    let mut dirs_to_scan = vec![(path.clone(), 0usize)];
+    let mut all_dirs = Vec::new();
+
+    while let Some((dir, depth)) = dirs_to_scan.pop() {
+        if depth > 3 {
+            continue;
         }
+        all_dirs.push(dir.clone());
 
-        if let Ok(entries) = fs::read_dir(dir) {
+        if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 if let Ok(metadata) = entry.metadata() {
-                    if metadata.is_file() {
-                        if let Some(path_str) = entry.path().to_str() {
-                            if path_str.to_lowercase().ends_with(".pdf") {
-                                if let Some(name) = entry.file_name().to_str() {
-                                    if let Ok(modified) = metadata.modified() {
-                                        if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
-                                            files.push(PdfFileInfo {
-                                                path: path_str.to_string(),
-                                                name: name.to_string(),
-                                                size: metadata.len(),
-                                                modified: duration.as_secs(),
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if metadata.is_dir() {
-                        // Escanear subdirectorios recursivamente
-                        scan_directory(&entry.path(), files, depth + 1);
+                    if metadata.is_dir() {
+                        dirs_to_scan.push((entry.path(), depth + 1));
                     }
                 }
             }
         }
     }
 
-    let path = PathBuf::from(&directory);
-    if !path.exists() {
-        return Err("El directorio no existe".to_string());
-    }
+    // Escanear directorios en paralelo
+    let pdf_files: Vec<PdfFileInfo> = all_dirs
+        .par_iter()
+        .flat_map(|dir| {
+            let mut files = Vec::new();
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    if let Ok(metadata) = entry.metadata() {
+                        if metadata.is_file() {
+                            if let Some(path_str) = entry.path().to_str() {
+                                if path_str.to_lowercase().ends_with(".pdf") {
+                                    if let Some(name) = entry.file_name().to_str() {
+                                        let modified_secs = metadata.modified()
+                                            .ok()
+                                            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                                            .map(|d| d.as_secs())
+                                            .unwrap_or(0);
 
-    scan_directory(&path, &mut pdf_files, 0);
+                                        files.push(PdfFileInfo {
+                                            path: path_str.to_string(),
+                                            name: name.to_string(),
+                                            size: metadata.len(),
+                                            modified: modified_secs,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            files
+        })
+        .collect();
+
     Ok(pdf_files)
 }
 

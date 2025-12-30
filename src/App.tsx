@@ -1,14 +1,63 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo, memo } from 'react'
 import { createPortal } from 'react-dom'
 import { open } from '@tauri-apps/plugin-dialog'
-import { readFile, exists } from '@tauri-apps/plugin-fs'
-import { FileTextIcon, ZoomInIcon, ZoomOutIcon, ResetIcon, Cross2Icon, GearIcon, MagnifyingGlassIcon, EnterFullScreenIcon, ExitFullScreenIcon } from '@radix-ui/react-icons'
+import { readFile, exists, remove } from '@tauri-apps/plugin-fs'
+import { FileTextIcon, ZoomInIcon, ZoomOutIcon, ResetIcon, Cross2Icon, GearIcon, MagnifyingGlassIcon, EnterFullScreenIcon, ExitFullScreenIcon, TrashIcon } from '@radix-ui/react-icons'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import 'pdfjs-dist/web/pdf_viewer.css'
 import { Store } from '@tauri-apps/plugin-store'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { invoke } from '@tauri-apps/api/core'
+
+// Componente Tooltip personalizado - memoizado
+interface TooltipProps {
+  children: React.ReactNode
+  text: string
+  shortcut?: string
+}
+
+const Tooltip = memo(function Tooltip({ children, text, shortcut }: TooltipProps) {
+  const [show, setShow] = useState(false)
+  const [position, setPosition] = useState({ top: 0, left: 0 })
+  const triggerRef = useRef<HTMLDivElement>(null)
+
+  const handleMouseEnter = useCallback(() => {
+    if (triggerRef.current) {
+      const rect = triggerRef.current.getBoundingClientRect()
+      setPosition({
+        top: rect.bottom + 8,
+        left: rect.left + rect.width / 2
+      })
+    }
+    setShow(true)
+  }, [])
+
+  const handleMouseLeave = useCallback(() => setShow(false), [])
+
+  return (
+    <div
+      ref={triggerRef}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
+      className="relative inline-flex"
+    >
+      {children}
+      {show && createPortal(
+        <div
+          className="fixed z-[100] px-3 py-2 bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 text-xs rounded-lg shadow-lg pointer-events-none whitespace-nowrap -translate-x-1/2"
+          style={{ top: position.top, left: position.left }}
+        >
+          <div className="font-medium">{text}</div>
+          {shortcut && (
+            <div className="text-gray-400 dark:text-gray-600 mt-0.5">({shortcut})</div>
+          )}
+        </div>,
+        document.body
+      )}
+    </div>
+  )
+})
 
 // Configurar el worker de PDF.js
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker
@@ -95,8 +144,8 @@ function App() {
       await store.set('recentFiles', recents)
       await store.save()
       setRecentFiles(recents)
-    } catch (error) {
-      console.error('Error al guardar en recientes:', error)
+    } catch {
+      // Error al guardar en recientes
     }
   }, [])
 
@@ -109,8 +158,8 @@ function App() {
       await store.set('recentFiles', recents)
       await store.save()
       setRecentFiles(recents)
-    } catch (error) {
-      console.error('Error al eliminar de recientes:', error)
+    } catch {
+      // Error
     }
   }, [])
 
@@ -121,34 +170,51 @@ function App() {
       await store.set('recentFiles', [])
       await store.save()
       setRecentFiles([])
-    } catch (error) {
-      console.error('Error al limpiar recientes:', error)
+    } catch {
+      // Error
     }
   }, [])
 
-  // Buscar PDFs en directorios comunes
+  // Buscar PDFs en directorios comunes - optimizado con búsqueda paralela
   const searchPdfsInSystem = useCallback(async () => {
+    if (isSearching) return // Evitar búsquedas simultáneas
     setIsSearching(true)
     try {
       const directories = await invoke<string[]>('get_common_directories')
-      let allPdfs: PdfFileInfo[] = []
 
-      for (const dir of directories) {
-        try {
-          const pdfs = await invoke<PdfFileInfo[]>('search_pdfs_in_directory', { directory: dir })
-          allPdfs = [...allPdfs, ...pdfs]
-        } catch (error) {
-          console.error(`Error al buscar en ${dir}:`, error)
-        }
-      }
+      // Ejecutar búsquedas en paralelo
+      const results = await Promise.all(
+        directories.map(dir =>
+          invoke<PdfFileInfo[]>('search_pdfs_in_directory', { directory: dir })
+            .catch(() => [] as PdfFileInfo[])
+        )
+      )
 
-      setExplorerPdfs(allPdfs)
-    } catch (error) {
-      console.error('Error al buscar PDFs:', error)
+      setExplorerPdfs(results.flat())
+    } catch {
+      // Error al buscar PDFs
     } finally {
       setIsSearching(false)
     }
-  }, [])
+  }, [isSearching])
+
+  // Eliminar PDF del sistema
+  const deletePdfFile = useCallback(async (path: string, e: React.MouseEvent) => {
+    e.stopPropagation()
+
+    const confirmed = window.confirm('¿Estás seguro de que quieres eliminar este archivo? Esta acción no se puede deshacer.')
+    if (!confirmed) return
+
+    try {
+      await remove(path)
+      // Actualizar la lista de PDFs
+      setExplorerPdfs(prev => prev.filter(pdf => pdf.path !== path))
+      // También eliminar de recientes si existe
+      await removeFromRecents(path)
+    } catch {
+      alert('No se pudo eliminar el archivo. Puede que no tengas permisos suficientes.')
+    }
+  }, [removeFromRecents])
 
   // Buscar en el PDF activo
   const searchInPDF = useCallback(async (term: string) => {
@@ -255,19 +321,29 @@ function App() {
     return () => clearTimeout(debounceSearch)
   }, [searchTerm, searchInPDF])
 
-  // Ordenar PDFs del explorador
-  const sortedExplorerPdfs = useCallback(() => {
+  // Buscar automáticamente cuando se abre el explorador
+  useEffect(() => {
+    if (showExplorer && explorerPdfs.length === 0 && !isSearching) {
+      searchPdfsInSystem()
+    }
+  }, [showExplorer]) // Solo depende de showExplorer para evitar loops
+
+  // Ordenar PDFs del explorador - usando useMemo para evitar recálculos
+  const sortedExplorerPdfs = useMemo(() => {
+    if (explorerPdfs.length === 0) return []
+
     let filtered = explorerPdfs
 
     // Filtrar por término de búsqueda
     if (explorerSearchTerm) {
+      const lowerTerm = explorerSearchTerm.toLowerCase()
       filtered = filtered.filter(pdf =>
-        pdf.name.toLowerCase().includes(explorerSearchTerm.toLowerCase())
+        pdf.name.toLowerCase().includes(lowerTerm)
       )
     }
 
     // Ordenar
-    const sorted = [...filtered].sort((a, b) => {
+    return [...filtered].sort((a, b) => {
       let comparison = 0
       switch (sortBy) {
         case 'name':
@@ -282,8 +358,6 @@ function App() {
       }
       return sortAscending ? comparison : -comparison
     })
-
-    return sorted
   }, [explorerPdfs, explorerSearchTerm, sortBy, sortAscending])
 
   // Cargar PDF desde una ruta
@@ -293,8 +367,7 @@ function App() {
 
       const fileExists = await exists(path)
       if (!fileExists) {
-        console.error('El archivo no existe:', path)
-        setIsLoading(false)
+  setIsLoading(false)
         return
       }
 
@@ -319,8 +392,7 @@ function App() {
       await addToRecents(path, fileName)
 
       setIsLoading(false)
-    } catch (error) {
-      console.error('Error al cargar el PDF:', error)
+    } catch {
       setIsLoading(false)
     }
   }, [addToRecents])
@@ -363,56 +435,18 @@ function App() {
     const loadSettings = async () => {
       try {
         const store = await Store.load('settings.json')
-        const savedTheme = await store.get<ThemeMode>('theme')
-        const savedTabs = await store.get<{ path: string }[]>('openTabs')
-        const savedRecents = await store.get<RecentFile[]>('recentFiles') || []
-
-        console.log('Configuración cargada:', { savedTheme, savedTabs, savedRecents })
+        const [savedTheme, savedRecents] = await Promise.all([
+          store.get<ThemeMode>('theme'),
+          store.get<RecentFile[]>('recentFiles')
+        ])
 
         if (savedTheme) {
           setThemeMode(savedTheme)
         }
 
-        setRecentFiles(savedRecents)
-
-        // Cargar el último PDF abierto
-        if (savedTabs && savedTabs.length > 0) {
-          const lastPath = savedTabs[0].path
-          console.log('Cargando último PDF:', lastPath)
-
-          try {
-            // Verificar que existe
-            const fileExists = await exists(lastPath)
-            if (fileExists) {
-              const fileData = await readFile(lastPath)
-              const fileName = lastPath.split('\\').pop() || lastPath.split('/').pop() || 'documento.pdf'
-
-              const loadingTask = pdfjsLib.getDocument({ data: fileData })
-              const pdf = await loadingTask.promise
-
-              const newTab: PDFTab = {
-                id: Date.now().toString(),
-                fileName,
-                filePath: lastPath,
-                document: pdf,
-                scale: 1.2
-              }
-
-              setTabs([newTab])
-              setActiveTabId(newTab.id)
-            }
-          } catch (error) {
-            console.log('No se pudo cargar el último PDF:', error)
-            // Limpiar la configuración de tabs guardados si falla
-            const store = await Store.load('settings.json')
-            await store.set('openTabs', [])
-            await store.save()
-          }
-        }
-
+        setRecentFiles(savedRecents || [])
         setInitialized(true)
       } catch (error) {
-        console.error('Error al cargar configuración:', error)
         setInitialized(true)
       }
     }
@@ -432,8 +466,8 @@ function App() {
             }
           }
         }
-      } catch (error) {
-        console.error('Error al cargar archivos pendientes:', error)
+      } catch {
+        // Error al cargar archivos pendientes
       }
     }
 
@@ -484,39 +518,18 @@ function App() {
     const setupFileListener = async () => {
       const appWindow = getCurrentWindow()
 
-      console.log('[FRONTEND] Setting up file listener...')
-
-      // Escuchar el evento unificado 'open-files'
       unlisten = await appWindow.listen<string[]>('open-files', async (event) => {
-        console.log('[FRONTEND] ========== open-files event received ==========')
-        console.log('[FRONTEND] Event payload:', event.payload)
-        console.log('[FRONTEND] Payload type:', typeof event.payload)
-        console.log('[FRONTEND] Payload is array:', Array.isArray(event.payload))
         for (const filePath of event.payload) {
-          console.log('[FRONTEND] Processing file:', filePath)
           if (filePath.toLowerCase().endsWith('.pdf')) {
-            // Cargar el PDF directamente
             try {
-              console.log('[FRONTEND] Checking if file exists:', filePath)
               const fileExists = await exists(filePath)
-              console.log('[FRONTEND] File exists:', fileExists)
+              if (!fileExists) continue
 
-              if (!fileExists) {
-                console.error('[FRONTEND] El archivo no existe:', filePath)
-                continue
-              }
-
-              console.log('[FRONTEND] Reading file data...')
               const fileData = await readFile(filePath)
-              console.log('[FRONTEND] File data read, size:', fileData.length)
-
               const fileName = filePath.split('\\').pop() || filePath.split('/').pop() || 'documento.pdf'
-              console.log('[FRONTEND] File name:', fileName)
 
-              console.log('[FRONTEND] Loading PDF document...')
               const loadingTask = pdfjsLib.getDocument({ data: fileData })
               const pdf = await loadingTask.promise
-              console.log('[FRONTEND] PDF loaded, pages:', pdf.numPages)
 
               const newTab: PDFTab = {
                 id: Date.now().toString(),
@@ -526,24 +539,18 @@ function App() {
                 scale: 1.2
               }
 
-              console.log('[FRONTEND] Adding tab to state...')
               setTabs(prev => {
-                // Verificar si ya está abierto
                 const existing = prev.find(tab => tab.filePath === filePath)
                 if (existing) {
-                  console.log('[FRONTEND] File already open, switching to existing tab')
                   setActiveTabId(existing.id)
                   return prev
                 }
-                console.log('[FRONTEND] Creating new tab')
                 setActiveTabId(newTab.id)
                 return [...prev, newTab]
               })
-              console.log('[FRONTEND] Adding to recents...')
               await addToRecents(filePath, fileName)
-              console.log('[FRONTEND] Successfully loaded PDF!')
-            } catch (error) {
-              console.error('[FRONTEND] Error al cargar PDF:', error)
+            } catch {
+              // Error al cargar PDF
             }
           }
         }
@@ -569,9 +576,8 @@ function App() {
         const tabsToSave = tabs.map(tab => ({ path: tab.filePath }))
         await store.set('openTabs', tabsToSave)
         await store.save()
-        console.log('Pestañas guardadas:', tabsToSave)
-      } catch (error) {
-        console.error('Error al guardar pestañas:', error)
+      } catch {
+        // Error al guardar pestañas
       }
     }
 
@@ -596,8 +602,7 @@ function App() {
       }
 
       await loadPDFFromPath(selected)
-    } catch (error) {
-      console.error('Error al abrir el PDF:', error)
+    } catch {
       setIsLoading(false)
     }
   }
@@ -680,9 +685,8 @@ function App() {
       const store = await Store.load('settings.json')
       await store.set('theme', theme)
       await store.save()
-      console.log('Tema guardado:', theme)
-    } catch (error) {
-      console.error('Error al guardar tema:', error)
+    } catch {
+      // Error al guardar tema
     }
   }
 
@@ -691,7 +695,7 @@ function App() {
     saveTheme(theme)
   }
 
-  // Renderizar páginas del PDF activo
+  // Renderizar páginas del PDF activo - optimizado
   useEffect(() => {
     if (!activeTab) return
 
@@ -704,19 +708,20 @@ function App() {
 
         const page = await activeTab.document.getPage(pageNum)
         const viewport = page.getViewport({ scale: activeTab.scale })
-        const context = canvas.getContext('2d')
+        const context = canvas.getContext('2d', { alpha: false }) // Optimización: sin transparencia
 
         if (!context || cancelled) return
 
-        canvas.height = viewport.height
-        canvas.width = viewport.width
-
-        const renderContext = {
-          canvasContext: context,
-          viewport: viewport
+        // Evitar re-renderizar si ya tiene el tamaño correcto
+        if (canvas.height !== viewport.height || canvas.width !== viewport.width) {
+          canvas.height = viewport.height
+          canvas.width = viewport.width
         }
 
-        const renderTask = page.render(renderContext)
+        const renderTask = page.render({
+          canvasContext: context,
+          viewport: viewport
+        })
         renderTasks.set(pageNum, renderTask)
 
         await renderTask.promise
@@ -733,79 +738,65 @@ function App() {
 
             const textContent = await page.getTextContent()
 
-            // Crear elementos de texto para cada item
+            // Usar DocumentFragment para mejor rendimiento
+            const fragment = document.createDocumentFragment()
+
             textContent.items.forEach((item: any) => {
               if (!item.str || item.str.trim() === '') return
 
               const textDiv = document.createElement('span')
               textDiv.textContent = item.str
-              textDiv.style.position = 'absolute'
+              textDiv.style.cssText = 'position:absolute;color:transparent;user-select:text;cursor:text;pointer-events:all;font-family:sans-serif;'
 
-              // Transformar coordenadas
-              const tx = pdfjsLib.Util.transform(
-                viewport.transform,
-                item.transform
-              )
-
+              const tx = pdfjsLib.Util.transform(viewport.transform, item.transform)
               const fontHeight = Math.sqrt((tx[2] * tx[2]) + (tx[3] * tx[3]))
-              const fontSize = fontHeight
 
               textDiv.style.left = `${tx[4]}px`
-              textDiv.style.top = `${tx[5] - fontSize}px`
-              textDiv.style.fontSize = `${fontSize}px`
-              textDiv.style.fontFamily = 'sans-serif'
+              textDiv.style.top = `${tx[5] - fontHeight}px`
+              textDiv.style.fontSize = `${fontHeight}px`
+              textDiv.style.width = `${item.width * viewport.scale}px`
 
-              // Calcular el ancho del texto
-              const textWidth = item.width * viewport.scale
-              textDiv.style.width = `${textWidth}px`
-
-              textDiv.style.color = 'transparent'
-              textDiv.style.userSelect = 'text'
-              textDiv.style.cursor = 'text'
-              textDiv.style.pointerEvents = 'all'
-
-              textLayer.appendChild(textDiv)
+              fragment.appendChild(textDiv)
             })
+
+            textLayer.appendChild(fragment)
           }
         }
-      } catch (error: any) {
-        // Ignorar errores de cancelación
-        if (error?.name !== 'RenderingCancelledException') {
-          console.error(`Error al renderizar página ${pageNum}:`, error)
-        }
+      } catch {
+        // Ignorar errores de renderizado
       }
     }
 
     const renderAllPages = async () => {
       // Esperar un tick para que los refs estén disponibles
-      await new Promise(resolve => setTimeout(resolve, 50))
+      await new Promise(resolve => requestAnimationFrame(resolve))
 
       if (cancelled) return
 
       const tabCanvases = canvasRefs.current.get(activeTab.id)
       if (!tabCanvases || tabCanvases.size === 0) {
-        // Reintentar si no hay canvas disponibles
         if (!cancelled) {
-          setTimeout(renderAllPages, 100)
+          requestAnimationFrame(renderAllPages)
         }
         return
       }
 
       if (viewMode === 'cascade') {
-        // Renderizar todas las páginas
-        for (let i = 1; i <= activeTab.document.numPages; i++) {
+        // Renderizar páginas en lotes para mejor rendimiento
+        const pagesToRender = Array.from({ length: activeTab.document.numPages }, (_, i) => i + 1)
+        const batchSize = 3 // Renderizar 3 páginas a la vez
+
+        for (let i = 0; i < pagesToRender.length; i += batchSize) {
           if (cancelled) break
-          const canvas = tabCanvases.get(i)
-          if (canvas) {
-            await renderPage(i, canvas)
-          }
+          const batch = pagesToRender.slice(i, i + batchSize)
+          await Promise.all(batch.map(async (pageNum) => {
+            const canvas = tabCanvases.get(pageNum)
+            if (canvas) await renderPage(pageNum, canvas)
+          }))
         }
       } else {
-        // Renderizar solo la página actual
         const canvas = tabCanvases.get(currentPage)
-        if (canvas) {
-          await renderPage(currentPage, canvas)
-        }
+        if (canvas) await renderPage(currentPage, canvas)
       }
     }
 
@@ -813,13 +804,8 @@ function App() {
 
     return () => {
       cancelled = true
-      // Cancelar todas las tareas de renderizado pendientes
       renderTasks.forEach(task => {
-        try {
-          task.cancel()
-        } catch (e) {
-          // Ignorar errores al cancelar
-        }
+        try { task.cancel() } catch {}
       })
       renderTasks.clear()
     }
@@ -860,9 +846,8 @@ function App() {
         e.preventDefault()
         try {
           await invoke('open_devtools')
-          console.log('DevTools opened')
-        } catch (error) {
-          console.error('Error opening DevTools:', error)
+        } catch {
+          // Error opening DevTools
         }
         return
       }
@@ -879,9 +864,6 @@ function App() {
       if ((e.ctrlKey || e.metaKey) && e.key === 'e') {
         e.preventDefault()
         setShowExplorer(prev => !prev)
-        if (!showExplorer && explorerPdfs.length === 0) {
-          searchPdfsInSystem()
-        }
       }
 
       // F11 o Ctrl + F: Pantalla completa
@@ -981,12 +963,7 @@ function App() {
           </button>
 
           <button
-            onClick={() => {
-              setShowExplorer(!showExplorer)
-              if (!showExplorer && explorerPdfs.length === 0) {
-                searchPdfsInSystem()
-              }
-            }}
+            onClick={() => setShowExplorer(!showExplorer)}
             className="flex-shrink-0 px-3 py-1.5 text-xs font-medium text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-800 rounded transition-colors"
           >
             Explorador
@@ -1088,70 +1065,76 @@ function App() {
               )}
 
               {/* Search Button */}
-              <button
-                onClick={() => setShowSearch(!showSearch)}
-                className={`p-2 rounded-lg transition-colors ${
-                  showSearch
-                    ? 'bg-gray-900 dark:bg-gray-100'
-                    : 'hover:bg-gray-100 dark:hover:bg-gray-800'
-                }`}
-                title="Buscar (Ctrl+H)"
-              >
-                <MagnifyingGlassIcon className={`w-4 h-4 ${showSearch ? 'text-white dark:text-gray-900' : 'text-gray-700 dark:text-gray-300'}`} />
-              </button>
+              <Tooltip text="Buscar en PDF" shortcut="Ctrl+H">
+                <button
+                  onClick={() => setShowSearch(!showSearch)}
+                  className={`p-2 rounded-lg transition-colors ${
+                    showSearch
+                      ? 'bg-gray-900 dark:bg-gray-100'
+                      : 'hover:bg-gray-100 dark:hover:bg-gray-800'
+                  }`}
+                >
+                  <MagnifyingGlassIcon className={`w-4 h-4 ${showSearch ? 'text-white dark:text-gray-900' : 'text-gray-700 dark:text-gray-300'}`} />
+                </button>
+              </Tooltip>
 
               {/* Fullscreen Button */}
-              <button
-                onClick={toggleFullscreen}
-                className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors"
-                title="Pantalla completa (F11)"
-              >
-                {isFullscreen ? (
-                  <ExitFullScreenIcon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
-                ) : (
-                  <EnterFullScreenIcon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
-                )}
-              </button>
+              <Tooltip text="Pantalla completa" shortcut="F11">
+                <button
+                  onClick={toggleFullscreen}
+                  className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors"
+                >
+                  {isFullscreen ? (
+                    <ExitFullScreenIcon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
+                  ) : (
+                    <EnterFullScreenIcon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
+                  )}
+                </button>
+              </Tooltip>
 
               {/* Zoom Controls */}
               <div className="flex items-center gap-1 bg-gray-100 dark:bg-gray-800 rounded-lg p-1">
-                <button
-                  onClick={handleZoomOut}
-                  className="p-1.5 hover:bg-white dark:hover:bg-gray-700 rounded transition-colors"
-                  title="Reducir zoom"
-                >
-                  <ZoomOutIcon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
-                </button>
+                <Tooltip text="Reducir zoom" shortcut="Ctrl+-">
+                  <button
+                    onClick={handleZoomOut}
+                    className="p-1.5 hover:bg-white dark:hover:bg-gray-700 rounded transition-colors"
+                  >
+                    <ZoomOutIcon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
+                  </button>
+                </Tooltip>
 
                 <span className="px-3 text-xs font-medium text-gray-700 dark:text-gray-300 min-w-[50px] text-center">
                   {Math.round(activeTab.scale * 100)}%
                 </span>
 
-                <button
-                  onClick={handleZoomIn}
-                  className="p-1.5 hover:bg-white dark:hover:bg-gray-700 rounded transition-colors"
-                  title="Aumentar zoom"
-                >
-                  <ZoomInIcon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
-                </button>
+                <Tooltip text="Aumentar zoom" shortcut="Ctrl++">
+                  <button
+                    onClick={handleZoomIn}
+                    className="p-1.5 hover:bg-white dark:hover:bg-gray-700 rounded transition-colors"
+                  >
+                    <ZoomInIcon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
+                  </button>
+                </Tooltip>
 
-                <button
-                  onClick={handleResetZoom}
-                  className="p-1.5 hover:bg-white dark:hover:bg-gray-700 rounded transition-colors"
-                  title="Restablecer zoom"
-                >
-                  <ResetIcon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
-                </button>
+                <Tooltip text="Restablecer zoom" shortcut="Ctrl+0">
+                  <button
+                    onClick={handleResetZoom}
+                    className="p-1.5 hover:bg-white dark:hover:bg-gray-700 rounded transition-colors"
+                  >
+                    <ResetIcon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
+                  </button>
+                </Tooltip>
               </div>
 
               {/* Settings Button */}
-              <button
-                onClick={() => setShowSettings(!showSettings)}
-                className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors"
-                title="Ajustes"
-              >
-                <GearIcon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
-              </button>
+              <Tooltip text="Ajustes" shortcut="Ctrl+,">
+                <button
+                  onClick={() => setShowSettings(!showSettings)}
+                  className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors"
+                >
+                  <GearIcon className="w-4 h-4 text-gray-700 dark:text-gray-300" />
+                </button>
+              </Tooltip>
             </div>
           </div>
         )}
@@ -1316,31 +1299,43 @@ function App() {
                     <p className="text-sm text-gray-600 dark:text-gray-400">Buscando PDFs...</p>
                   </div>
                 </div>
-              ) : sortedExplorerPdfs().length === 0 ? (
+              ) : explorerPdfs.length === 0 ? (
+                <div className="flex items-center justify-center h-full">
+                  <div className="text-center space-y-3 px-4">
+                    <FileTextIcon className="w-12 h-12 mx-auto text-gray-400 dark:text-gray-600" />
+                    <p className="text-sm text-gray-600 dark:text-gray-400">
+                      No se encontraron archivos PDF
+                    </p>
+                    <button
+                      onClick={searchPdfsInSystem}
+                      className="px-4 py-2 text-sm bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 rounded-lg hover:bg-gray-800 dark:hover:bg-gray-200 transition-colors font-medium"
+                    >
+                      Reintentar
+                    </button>
+                  </div>
+                </div>
+              ) : sortedExplorerPdfs.length === 0 ? (
                 <div className="flex items-center justify-center h-full">
                   <div className="text-center space-y-2 px-4">
                     <FileTextIcon className="w-12 h-12 mx-auto text-gray-400 dark:text-gray-600" />
                     <p className="text-sm text-gray-600 dark:text-gray-400">
-                      {explorerPdfs.length === 0 ? 'No se encontraron PDFs' : 'No hay resultados'}
+                      No hay resultados para "{explorerSearchTerm}"
                     </p>
-                    <button
-                      onClick={searchPdfsInSystem}
-                      className="px-3 py-1.5 text-xs bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 rounded hover:bg-gray-800 dark:hover:bg-gray-200 transition-colors"
-                    >
-                      Buscar de nuevo
-                    </button>
                   </div>
                 </div>
               ) : (
                 <div className="p-2">
-                  {sortedExplorerPdfs().map((pdf) => (
-                    <button
+                  <div className="px-2 pb-2 text-xs text-gray-500 dark:text-gray-500">
+                    {sortedExplorerPdfs.length} archivos encontrados
+                  </div>
+                  {sortedExplorerPdfs.slice(0, 100).map((pdf) => (
+                    <div
                       key={pdf.path}
+                      className="group w-full p-3 text-left hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors mb-1 cursor-pointer"
                       onClick={async () => {
                         setShowExplorer(false)
                         await loadPDFFromPath(pdf.path)
                       }}
-                      className="w-full p-3 text-left hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors mb-1"
                     >
                       <div className="flex items-start gap-2">
                         <FileTextIcon className="w-4 h-4 text-gray-500 dark:text-gray-400 flex-shrink-0 mt-0.5" />
@@ -1353,9 +1348,22 @@ function App() {
                             <span>{new Date(pdf.modified * 1000).toLocaleDateString()}</span>
                           </div>
                         </div>
+                        <Tooltip text="Eliminar archivo">
+                          <button
+                            onClick={(e) => deletePdfFile(pdf.path, e)}
+                            className="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-red-100 dark:hover:bg-red-900/30 rounded transition-all"
+                          >
+                            <TrashIcon className="w-4 h-4 text-red-500 dark:text-red-400" />
+                          </button>
+                        </Tooltip>
                       </div>
-                    </button>
+                    </div>
                   ))}
+                  {sortedExplorerPdfs.length > 100 && (
+                    <div className="px-2 py-3 text-xs text-center text-gray-500 dark:text-gray-500">
+                      Mostrando 100 de {sortedExplorerPdfs.length} archivos. Usa el filtro para refinar.
+                    </div>
+                  )}
                 </div>
               )}
             </div>
